@@ -1,0 +1,16 @@
+__pycache__/
+*.py[cod]
+*.so
+
+build/
+install/
+log/
+
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+*.bag
+*.db3
+*.log
+
