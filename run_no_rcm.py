@@ -734,22 +734,27 @@ class Config:
     # z-only 仲裁下的 continuous_force_margin 默认参数。
     # x/y 已由 robot_interface 固定 alpha=1 严格位置跟踪；这里的 alpha 只作用
     # 于 z/压入深度，因此默认允许更低的 z 向位置权重以改善力跟踪。
-    continuous_safe_tracking_alpha = 0.26
+    continuous_safe_tracking_alpha = 0.34
     continuous_safe_tracking_extra = 0.03
-    continuous_force_balance_alpha = 0.26
-    continuous_force_guard_alpha = 0.42
-    continuous_low_force_guard_alpha = 0.12
-    continuous_alpha_min = 0.10
-    continuous_alpha_max = 0.46
+    continuous_force_balance_alpha = 0.34
+    continuous_force_guard_alpha = 0.62
+    continuous_low_force_guard_alpha = 0.20
+    continuous_alpha_min = 0.16
+    continuous_alpha_max = 0.72
     continuous_risk_margin_start = 0.20
     continuous_risk_margin_full = 0.04
-    continuous_smooth_tau = 0.80
+    continuous_smooth_tau = 0.55
     continuous_stiffness_alpha_enabled = True
-    continuous_stiffness_low_threshold = 320.0
+    continuous_stiffness_low_threshold = 300.0
     continuous_stiffness_high_threshold = 500.0
-    continuous_stiffness_low_alpha = 0.22
-    continuous_stiffness_high_alpha = 0.44
-    continuous_stiffness_blend = 0.45
+    continuous_stiffness_low_alpha = 0.29
+    continuous_stiffness_high_alpha = 0.62
+    continuous_stiffness_blend = 0.88
+    continuous_stiffness_transition_alpha = 0.56
+    continuous_stiffness_transition_dk_start = 12.0
+    continuous_stiffness_transition_dk_full = 90.0
+    continuous_stiffness_low_force_relief = 0.06
+    continuous_stiffness_high_force_guard = 0.04
 
 
 def apply_benchmark_config(cfg, benchmark):
@@ -1704,6 +1709,11 @@ STRATEGIES = {
         stiffness_low_alpha=cfg.continuous_stiffness_low_alpha,
         stiffness_high_alpha=cfg.continuous_stiffness_high_alpha,
         stiffness_blend=cfg.continuous_stiffness_blend,
+        stiffness_transition_alpha=cfg.continuous_stiffness_transition_alpha,
+        stiffness_transition_dk_start=cfg.continuous_stiffness_transition_dk_start,
+        stiffness_transition_dk_full=cfg.continuous_stiffness_transition_dk_full,
+        stiffness_low_force_relief=cfg.continuous_stiffness_low_force_relief,
+        stiffness_high_force_guard=cfg.continuous_stiffness_high_force_guard,
     ),
     'online_priority': lambda cfg: OnlinePriorityAdaptationAlphaScheduler(
         dt=0.01,

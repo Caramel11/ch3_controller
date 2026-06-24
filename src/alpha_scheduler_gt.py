@@ -539,6 +539,11 @@ class ContinuousForceMarginFuzzyAlphaScheduler(ForceMarginFuzzyAlphaScheduler):
                  stiffness_low_alpha=0.45,
                  stiffness_high_alpha=0.90,
                  stiffness_blend=0.0,
+                 stiffness_transition_alpha=0.62,
+                 stiffness_transition_dk_start=12.0,
+                 stiffness_transition_dk_full=90.0,
+                 stiffness_low_force_relief=0.06,
+                 stiffness_high_force_guard=0.04,
                  **kwargs):
         kwargs.setdefault("smooth_tau", 0.12)
         super().__init__(
@@ -578,6 +583,14 @@ class ContinuousForceMarginFuzzyAlphaScheduler(ForceMarginFuzzyAlphaScheduler):
         self.stiffness_low_alpha = float(stiffness_low_alpha)
         self.stiffness_high_alpha = float(stiffness_high_alpha)
         self.stiffness_blend = float(np.clip(stiffness_blend, 0.0, 1.0))
+        self.stiffness_transition_alpha = float(stiffness_transition_alpha)
+        self.stiffness_transition_dk_start = float(max(stiffness_transition_dk_start, 0.0))
+        self.stiffness_transition_dk_full = float(max(
+            stiffness_transition_dk_full,
+            self.stiffness_transition_dk_start + 1e-6,
+        ))
+        self.stiffness_low_force_relief = float(max(stiffness_low_force_relief, 0.0))
+        self.stiffness_high_force_guard = float(max(stiffness_high_force_guard, 0.0))
         self._alpha_filt = self.safe_tracking_alpha
 
     def _compute_phase_prior(self, phase, F_norm, z_vel):
@@ -645,13 +658,12 @@ class ContinuousForceMarginFuzzyAlphaScheduler(ForceMarginFuzzyAlphaScheduler):
             alpha = (1.0 - low_gate) * alpha + low_gate * alpha_low
         return float(np.clip(alpha, self.alpha_min, self.alpha_max))
 
-    def _stiffness_rebalance(self, alpha_safe, K_hat, F_err=0.0):
+    def _stiffness_rebalance(self, alpha_safe, K_hat, F_err=0.0, dK=0.0):
         """根据估计刚度和力误差方向平滑调节 z 向 alpha 目标。
 
-        alpha 只作用在 z/压入方向时，高刚度区不能无条件提高 alpha。
-        若高刚度区实际力低于期望，继续提高 z 位置权重会把压入深度锁在
-        参考附近，反而扩大力误差；此时应降低 alpha 给力通道补偿空间。
-        只有高刚度且力偏高时，才提高 alpha 抑制过压和振荡。
+        刚度项给出可解释的稳态目标: 低刚度区偏力调节，高刚度区偏位置
+        和几何稳定。力误差方向只做小幅二级修正，避免 alpha 完全由瞬态
+        力误差触发而失去刚度区适应性。
         """
         if (
             not self.stiffness_alpha_enabled
@@ -665,8 +677,6 @@ class ContinuousForceMarginFuzzyAlphaScheduler(ForceMarginFuzzyAlphaScheduler):
             (float(K_hat) - self.stiffness_low_threshold)
             / (self.stiffness_high_threshold - self.stiffness_low_threshold)
         )
-        if k_gate <= 1e-9:
-            return alpha_safe
 
         low_force_gate = _smoothstep(
             (-float(F_err) - self.force_error_start)
@@ -676,16 +686,28 @@ class ContinuousForceMarginFuzzyAlphaScheduler(ForceMarginFuzzyAlphaScheduler):
             (float(F_err) - self.force_error_start)
             / (self.force_error_full - self.force_error_start)
         )
+        transition_gate = _smoothstep(
+            (abs(float(dK)) - self.stiffness_transition_dk_start)
+            / (self.stiffness_transition_dk_full - self.stiffness_transition_dk_start)
+        )
 
-        alpha = float(alpha_safe)
-        low_blend = self.stiffness_blend * k_gate * low_force_gate
-        if low_blend > 1e-9:
-            alpha = (1.0 - low_blend) * alpha + low_blend * self.stiffness_low_alpha
+        alpha_k = (
+            (1.0 - k_gate) * self.stiffness_low_alpha
+            + k_gate * self.stiffness_high_alpha
+        )
+        if transition_gate > 1e-9:
+            alpha_k = (
+                (1.0 - transition_gate) * alpha_k
+                + transition_gate * max(alpha_k, self.stiffness_transition_alpha)
+            )
+        alpha_k -= self.stiffness_low_force_relief * low_force_gate
+        alpha_k += self.stiffness_high_force_guard * high_force_gate * max(k_gate, 0.25)
+        alpha_k = float(np.clip(alpha_k, self.alpha_min, self.alpha_max))
 
-        high_blend = self.stiffness_blend * k_gate * high_force_gate
-        if high_blend > 1e-9:
-            alpha = (1.0 - high_blend) * alpha + high_blend * self.stiffness_high_alpha
-
+        alpha = (
+            (1.0 - self.stiffness_blend) * float(alpha_safe)
+            + self.stiffness_blend * alpha_k
+        )
         return float(np.clip(alpha, self.alpha_min, self.alpha_max))
 
     def compute(self, F_norm, e_f=0.0, K_hat=None, e_r=0.0, z_vel=0.0,
@@ -722,7 +744,9 @@ class ContinuousForceMarginFuzzyAlphaScheduler(ForceMarginFuzzyAlphaScheduler):
             alpha_safe = self._force_risk_rebalance(
                 alpha_safe, rho_F=rho_F, F_err=F_err
             )
-        alpha_safe = self._stiffness_rebalance(alpha_safe, K_hat, F_err=F_err)
+        alpha_safe = self._stiffness_rebalance(
+            alpha_safe, K_hat, F_err=F_err, dK=dK
+        )
         alpha_safe = float(np.clip(alpha_safe, self.alpha_min, self.alpha_max))
 
         alpha_raw = w_phi * alpha_phi + (1.0 - w_phi) * alpha_safe

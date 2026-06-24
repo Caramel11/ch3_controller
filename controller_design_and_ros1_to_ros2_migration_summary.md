@@ -325,6 +325,60 @@ ROS1 到 ROS2 后，力信号来源、滤波和接触模型可能变化。迁移
 
 原因通常是 Gazebo 动力学已经开始积分，但重力补偿或 effort controller 尚未 active。解决方案是零重力启动，控制器 active 后恢复重力。
 
+本项目中最终保留两类启动路径，不能混用它们的参数语义。
+
+第一类是有重力 handoff 路径，目标是验证 Gazebo 正常重力下的启动保持:
+
+```bash
+source /opt/ros/humble/setup.bash
+source /home/liu/franka_ros2_ws/install/setup.bash
+ros2 launch franka_gazebo_bringup gazebo_franka_arm_startup_gravity_comp.launch.py \
+  robot_type:=fr3 \
+  load_gripper:=false \
+  rviz:=false
+```
+
+该路径的设计原则是:
+
+- 使用 `empty_no_gravity.sdf` 先让 Gazebo 在零重力下启动。
+- 同步启动 `gravity_compensation_example_controller`。
+- `gazebo_gravity_handoff` 等待该控制器进入 `active`。
+- 控制器 active 后调用 `/world/empty_no_gravity/set_physics` 恢复 `z=-9.8`。
+- 后续若要切换到 `no_rcm_effort_controller`，必须确认旧控制器停止、新控制器 active、命令 topic 正确，并避免控制空窗。
+
+第二类是当前 no-RCM 控制器回归验证的稳定路径，目标是排除重力 handoff 引入的额外不确定性，专注验证控制律本身:
+
+```bash
+source /opt/ros/humble/setup.bash
+cd /home/liu/franka_ros2_ws
+source install/setup.bash
+ros2 launch franka_gazebo_bringup gazebo_franka_arm_example_controller.launch.py \
+  robot_type:=fr3 \
+  load_gripper:=false \
+  rviz:=false \
+  gz_args:="-r /home/liu/franka_ros2_ws/install/franka_gazebo_bringup/share/franka_gazebo_bringup/worlds/empty_no_gravity.sdf" \
+  controller:=no_rcm_effort_controller
+```
+
+在第二类路径中运行 `run_no_rcm` 时应使用:
+
+```bash
+ros2 run ch3_controller run_no_rcm \
+  --strategy continuous_force_margin \
+  --controller-mode pareto_iter \
+  --trials 1 \
+  --output-dir /home/liu/franka_ros2_ws/results/ch3_controller_debug \
+  --no-auto-plot \
+  --plot-no-show \
+  --ros-args \
+  -p cmd_topic:=/no_rcm_effort_controller/commands \
+  -p state_topic:=/joint_states \
+  -p rsp_node:=/robot_state_publisher \
+  -p gravity_compensation_scale:=0.0
+```
+
+这里 `gravity_compensation_scale:=0.0` 是稳定 no-gravity Gazebo 路径下的要求，避免在仿真中额外叠加 Pinocchio 重力力矩。它不是对真实机器人或普通重力 Gazebo 的通用结论。
+
 ### 5.2 z 轴目标 0.3 m，但下降卡在 0.4 m 以上
 
 常见原因:
@@ -373,11 +427,187 @@ ROS1 到 ROS2 后，力信号来源、滤波和接触模型可能变化。迁移
 - 采用 `clear_contact -> return_home -> settle` 三段式。
 - 保留姿态控制，禁止末端复位时自转。
 
-## 6. 后续优化建议
+### 5.5 有重力补偿版本极不稳定
+
+最近一次调试表明，有重力补偿链路中的不稳定不一定来自 no-RCM 控制律本体，常见根因是控制器切换和重力补偿语义不清:
+
+- Gazebo 已恢复重力，但 no-RCM effort controller 尚未稳定发布命令。
+- `gravity_compensation_example_controller` 和 `no_rcm_effort_controller` 切换瞬间存在命令空窗。
+- 在 Gazebo 已经由其他控制器或零重力 world 处理重力时，又在 `robot_interface_ros2.py` 中叠加 Pinocchio 重力项。
+- 启动、接近、扫描、复位阶段使用了不同控制器，参考位姿或关节目标不连续。
+- 为了修补重力下坠而改动底层 topic、接口、handoff、robot interface，导致原本稳定的 no-RCM 控制律被连带破坏。
+
+处理原则:
+
+- 先回退到底层稳定版本，再只改一个问题域。
+- 如果目标是优化 alpha 仲裁，禁止同时改 Gazebo 启动、控制器切换、robot interface、力矩 topic 和重力补偿比例。
+- 使用 `git diff --name-only` 检查本轮是否只改预期文件。
+- 每次改动后先做 `python3 -m py_compile` 和 `colcon build --packages-select ch3_controller --symlink-install`。
+- 再用稳定 no-gravity Gazebo 路径跑完整接近、扫描、复位。
+- 只有在稳定基线通过后，才单独恢复有重力 handoff 验证。
+
+本轮最终采用的回退策略是: 删除此前不稳定的非 alpha 改动，保留过去稳定的 Gazebo 启动/控制路径，只修改 `run_no_rcm.py` 和 `src/alpha_scheduler_gt.py` 中与 alpha 仲裁相关的代码。
+
+### 5.6 后半段高刚度区域力和位置波动
+
+高刚度尾段的力波动主要不是 alpha 突变本身，而是 z 向压入深度的微小周期误差被环境刚度放大。以 500 N/m 环境刚度估算，0.05 mm 的 z 向波动即可造成约 0.025 N 的力变化。
+
+关键排查顺序:
+
+- 先看 `F_err` 与 `pos_err_z`、`delta` 的相关性。
+- 再看 `alpha` 是否发生台阶跳变或饱和。
+- 检查 `K_hat` 和 `K_env_true` 是否同向变化，避免刚度估计漂移。
+- 检查 `delta_dot` 或虚拟阻尼项是否把速度噪声放大为力噪声。
+- 检查扫描速度是否在高刚度区过快，使轨迹激励超过当前 z 向闭环带宽。
+
+已验证有效的低风险措施:
+
+- x/y 仍严格位置跟踪，alpha 只作用 z 向压入深度。
+- alpha 输入使用 z 轴位置误差，不再把 xy 轨迹滞后误差喂给 z 向仲裁。
+- 高刚度区提高 alpha，使压入几何更稳定。
+- 刚度快速变化区加入 transition alpha，避免 alpha 滞后。
+- 高刚度尾段可适度降低扫描速度，减少接触激励。
+
+不建议优先采用的措施:
+
+- 大幅降低 alpha 以追求力控，会放大 z 向位置漂移并可能丢失接触。
+- 对 force error 做过大的死区或限幅，会使欠力状态补偿不足。
+- 为改善指标而降低虚拟环境刚度分区，会削弱实验挑战性。
+- 重新引入强零空间姿态保持，会再次诱发腕部自转和 y 轴误差。
+
+### 5.7 alpha 对刚度变化不明显
+
+早期 `continuous_force_margin` 更强调力边界裕度，虽然传入了 `K_hat`，但稳定阶段的 alpha 对刚度变化不够明显。当前设计把刚度显式接入 z 向 alpha:
+
+```text
+g_K = smoothstep((K_hat - K_low) / (K_high - K_low))
+alpha_K = (1 - g_K) * alpha_low + g_K * alpha_high
+```
+
+随后将 `alpha_K` 与 force-margin 输出混合，并经过一阶滤波。设计含义是:
+
+- 低刚度区: alpha 偏低，给力通道更多调节空间。
+- 高刚度区: alpha 偏高，增强压入深度和几何稳定性。
+- 刚度快速变化区: transition alpha 提前抬高，避免刚度切换时 alpha 滞后。
+- 力偏低或偏高只做小幅修正，避免瞬态力噪声主导 alpha。
+
+本轮最小改动 Gazebo 验证结果:
+
+- 全程 force RMSE: 0.0817 N。
+- 全程 position RMSE: 2.637 mm。
+- alpha 范围: 0.257 到 0.584。
+- 后段 0.90-0.975 force error std: 0.0077 N。
+- 后段 0.90-0.975 measured force p2p: 0.0254 N。
+- 后段 0.90-0.975 alpha: 0.579 到 0.583。
+
+这说明 alpha 已经随刚度形成明显、可解释的变化。需要注意的是，force error 标准差已经低于 0.01 N，但实测力峰峰值仍约 0.025 N；若目标是把实测力峰峰值也压到 0.01 N 内，后续应重点处理接触模型、力滤波、z 向阻尼和高刚度区扫描速度，而不应只继续加大 alpha 调节幅度。
+
+## 6. 稳定基线与实验复现
+
+### 6.1 当前稳定基线
+
+当前建议把以下版本作为 no-RCM 控制律调试基线:
+
+- Gazebo 使用 `empty_no_gravity.sdf`。
+- 控制器使用 `no_rcm_effort_controller`。
+- `run_no_rcm` 参数使用 `gravity_compensation_scale:=0.0`。
+- 复位阶段使用自写位置/姿态控制器，不使用官方归位。
+- 末端期望姿态固定为 `[-90, 0, -45] deg`。
+- alpha 只作用 z 向，x/y 保持位置优先。
+
+验证命令:
+
+```bash
+cd /home/liu/franka_ros2_ws
+source /opt/ros/humble/setup.bash
+source install/setup.bash
+
+ros2 launch franka_gazebo_bringup gazebo_franka_arm_example_controller.launch.py \
+  robot_type:=fr3 \
+  load_gripper:=false \
+  rviz:=false \
+  gz_args:="-r /home/liu/franka_ros2_ws/install/franka_gazebo_bringup/share/franka_gazebo_bringup/worlds/empty_no_gravity.sdf" \
+  controller:=no_rcm_effort_controller
+```
+
+另开终端:
+
+```bash
+cd /home/liu/franka_ros2_ws
+source /opt/ros/humble/setup.bash
+source install/setup.bash
+
+ros2 run ch3_controller run_no_rcm \
+  --strategy continuous_force_margin \
+  --controller-mode pareto_iter \
+  --trials 1 \
+  --output-dir /home/liu/franka_ros2_ws/results/ch3_controller_debug \
+  --no-auto-plot \
+  --plot-no-show \
+  --ros-args \
+  -p cmd_topic:=/no_rcm_effort_controller/commands \
+  -p state_topic:=/joint_states \
+  -p rsp_node:=/robot_state_publisher \
+  -p gravity_compensation_scale:=0.0
+```
+
+绘图:
+
+```bash
+python3 /home/liu/franka_ros2_ws/src/ch3_controller/plot_latest_result.py \
+  --input /home/liu/franka_ros2_ws/results/ch3_controller_debug/<run_dir> \
+  --no-show
+```
+
+### 6.2 每轮改控制律前的检查清单
+
+- `git status --short` 确认工作区中有哪些改动。
+- 明确本轮只改一个问题域，例如 alpha、复位、姿态、Gazebo 启动、力滤波。
+- 先做离线 replay 或旧数据对比，再跑 Gazebo。
+- 跑 Gazebo 前确认 controller active:
+
+```bash
+ros2 control list_controllers
+ros2 topic list | grep -E 'joint_states|no_rcm_effort_controller'
+ros2 param get /robot_state_publisher robot_description | grep fr3_link11
+```
+
+- Gazebo 运行后检查日志是否完成 `approach -> contact/scan -> retreat`。
+- 绘图后看 force、position、orientation、front-axis、joint velocity、alpha、K_hat、K_env_true。
+- 若结果变差，先回退本轮改动，不要继续叠加修补。
+
+### 6.3 建议验收指标
+
+一次 no-RCM Gazebo 回归至少应满足:
+
+- 机械臂启动后不下坠。
+- 接近阶段能到达接触高度附近，不在 z=0.4 m 以上提前卡住。
+- 扫描阶段不出现腕部肉眼自转。
+- y 轴位置误差不因末端姿态抖动持续放大。
+- 末端 front-axis error 保持在低角度范围内。
+- 复位阶段回到初始末端笛卡尔位置，而不是抬到错误高度。
+- 复位阶段不跟踪力，且保持竖直向下、正面朝前。
+- 后半段高刚度区 force error std 不明显大于前段。
+- alpha 随刚度区间有可解释变化，而不是全程饱和或接近常数。
+
+## 7. 文档与结果索引
+
+本总结整合了以下本地文档和实验报告:
+
+- `README.md`: ROS2 移植包入口、Gazebo 启动命令、真机/仿真接口参数。
+- `gazebo_no_rcm_debug_report_20260624.md`: Gazebo 可视化调试流程、重力启动、接近/扫描/复位结果。
+- `continuous_force_margin_arbitration_report.md`: z-only alpha、force-margin、阶段先验、刚度响应项的理论说明。
+- `alpha_stiffness_adaptation_debug_report_20260624.md`: 高刚度尾段波动根因和 alpha 保守调参记录。
+- `stiffness_region_optimization_report_20260624.md`: 高刚度区扫描速度调节与波动对比。
+- `STIFFNESS_ESTIMATION_METHOD.md`: 表观刚度估计、阻尼辅助估计、日志字段含义。
+- `results/ch3_controller_alpha_minimal_gazebo/no_rcm_20260624_131107/analysis/alpha_minimal_gazebo_validation_report_20260624.md`: 回退稳定基线后，仅修改 alpha 仲裁的最小改动验证。
+
+## 8. 后续优化建议
 
 - 在不重新引入强零空间振荡的前提下，加入温和关节姿态代价，降低最大关节漂移。
 - 对扫描阶段力误差的负偏差进行小幅补偿，使平均力更接近 1.0 N。
 - 在复位 `settle` 阶段增加短时终端姿态增益，将终点姿态误差从约 2 deg 进一步压低。
 - 将 Gazebo 调试命令整理成 launch 或脚本，自动完成启动、controller switch、运行、绘图和报告生成。
 - 将分析脚本输出的 CSV 指标作为回归测试门槛，避免后续改控制律时重新引入末端抖动或复位失败。
-
+- 若继续追求力峰峰值小于 0.01 N，应优先研究接触模型、控制用力低通、z 向阻尼和高刚度区扫描速度，不应盲目增大 alpha 变化幅度。
+- 若重新启用有重力 handoff 验证，应单独建实验分支或提交点，避免把底层启动链路改动混入 alpha 控制律优化。
