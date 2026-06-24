@@ -574,6 +574,10 @@ class Config:
     # approach_z 是虚拟表面高度；tool 低于该高度时虚拟环境产生压入量。
     approach_z   = 0.30
     scan_vx      = 0.0016    # Phase 2 沿 x 的扫描速度, m/s；在稳定姿态下适度加快扫描
+    scan_vx_stiffness_adapt_enabled = True
+    scan_vx_stiffness_low_threshold = 420.0
+    scan_vx_stiffness_high_threshold = 500.0
+    scan_vx_stiffness_min_scale = 0.75
     force_consistent_scan_z = True  # 根据 F_desired/K_env 生成 z 参考，避免力/位目标冲突
     scan_z_min   = 0.2964    # 力一致 z 参考下限，防止低刚度估计导致过深压入
     scan_z_max   = 0.2984    # 力一致 z 参考上限，保留少量高刚度/过渡裕度
@@ -807,6 +811,22 @@ def scan_z_reference(cfg, venv, x):
     K_ref = max(float(K_ref), cfg.scan_z_stiffness_floor)
     z_ref = cfg.approach_z - cfg.F_desired / K_ref
     return float(np.clip(z_ref, cfg.scan_z_min, cfg.scan_z_max))
+
+
+def scan_vx_reference(cfg, K_hat):
+    """Reduce scan speed smoothly in high stiffness regions."""
+    vx = float(cfg.scan_vx)
+    if not getattr(cfg, "scan_vx_stiffness_adapt_enabled", False):
+        return vx
+    if K_hat is None or not np.isfinite(K_hat):
+        return vx
+
+    k_low = float(cfg.scan_vx_stiffness_low_threshold)
+    k_high = max(float(cfg.scan_vx_stiffness_high_threshold), k_low + 1e-6)
+    scale_min = float(np.clip(cfg.scan_vx_stiffness_min_scale, 0.1, 1.0))
+    s = float(np.clip((float(K_hat) - k_low) / (k_high - k_low), 0.0, 1.0))
+    gate = s * s * (3.0 - 2.0 * s)
+    return vx * ((1.0 - gate) + gate * scale_min)
 
 
 def slew_toward(current, target, max_step):
@@ -1466,9 +1486,10 @@ def run_trial(robot, kin_tool, kin_flange,
             if cfg.scan_z_gain_khat_max > 0.0 else K_hat
 
         # 当前期望 tool 位姿: x 随时间增长，y/z 固定。
+        scan_vx_eff = scan_vx_reference(cfg, K_hat)
         z_scan_ref = scan_z_reference(cfg, venv, x_cur)
         x_ref = np.array([x_cur, cfg.scan_y, z_scan_ref])
-        xdot_ref = np.array([cfg.scan_vx, 0, 0])
+        xdot_ref = np.array([scan_vx_eff, 0, 0])
 
         # 力目标: +z 方向为上 (接触反力方向)
         F_des = np.array([0.0, 0.0, cfg.F_desired])
@@ -1559,7 +1580,7 @@ def run_trial(robot, kin_tool, kin_flange,
         if cfg.torque_rate_limit > 0.0:
             tau = tau_limiter.update(tau, scan_dt)
         robot.exec_torque_cmd(tau)
-        x_cur += cfg.scan_vx * scan_dt
+        x_cur += scan_vx_eff * scan_dt
 
         pos_tool = tp.copy()
         pos_tool_des = x_ref.copy()
